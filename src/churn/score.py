@@ -1,16 +1,20 @@
-"""Score customers with the original MSc CatBoost churn model.
+"""Score customers with the churn model.
 
-The notebook only persisted encoder/scaler/selector/columns/model. The
+v1 (default): CatBoost retrained with an honest protocol (`churn.train`).
+v0: the original MSc model, kept to prove we can reproduce it. The notebook
+only persisted encoder/scaler/selector/columns/model. The
 correlation drop, winsor limits and rare-category mapping were never saved, so
 we re-fit them on the same seed-42 train split — the split is deterministic,
 so this reproduces the notebook's state exactly (checked in tests).
 """
 
+import json
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
+from catboost import CatBoostClassifier
 from sklearn.model_selection import train_test_split
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,6 +22,7 @@ DELIVERABLE = ROOT / "2_Entregable-20250630T141001Z-1-001" / "2_Entregable"
 TRAIN_CSV = DELIVERABLE / "churn - dataset a entrenar.csv"
 PREDICT_CSV = DELIVERABLE / "churn-dataset a predecir.csv"
 MODEL_DIR = DELIVERABLE / "modelo_churn"
+MODELS = ROOT / "models"
 TARGET = "churn"
 THRESHOLD = 0.472  # notebook's max-F1 threshold (tuned on the test set)
 
@@ -124,8 +129,8 @@ def deciles(proba: pd.Series) -> pd.Series:
     return pd.qcut(proba, 10, labels=range(1, 11)).astype(int).rename("decile")
 
 
-def run():
-    """Score the labelled test split and the unlabelled predict set."""
+def run_v0():
+    """Score the test split and predict set with the original MSc model."""
     art = load_artifacts()
     X_train, X_test, y_train, y_test = split(clean(pd.read_csv(TRAIN_CSV)))
     prep = fit_prep(X_train, y_train)
@@ -138,6 +143,47 @@ def run():
     X_pred = predict_df.drop(columns=["Customer_ID"])
     predict = pd.DataFrame({"customer_id": predict_df["Customer_ID"]})
     predict["churn_proba"] = score(X_pred, prep, art)
+    predict["decile"] = deciles(predict["churn_proba"])
+    return test, predict
+
+
+def split_v1(df: pd.DataFrame):
+    """Same rows as `split()`: identical n, stratify vector and seed."""
+    return train_test_split(df, test_size=0.3, random_state=42, stratify=df[TARGET])
+
+
+def features_v1(df: pd.DataFrame, cat_cols: list[str]) -> pd.DataFrame:
+    """v1 needs no imputation, clipping or encoding: CatBoost handles numeric
+    NaN natively, trees ignore monotone transforms, and text columns go in as
+    native categoricals."""
+    X = df.drop(columns=[TARGET, "Customer_ID"], errors="ignore").copy()
+    X[cat_cols] = X[cat_cols].fillna("NA").astype(str)
+    return X
+
+
+def load_v1() -> tuple[CatBoostClassifier, dict]:
+    meta = json.loads((MODELS / "churn_v1.json").read_text())
+    return CatBoostClassifier().load_model(str(MODELS / "churn_v1.cbm")), meta
+
+
+def score_v1(df: pd.DataFrame, model=None, meta=None) -> pd.Series:
+    if model is None:
+        model, meta = load_v1()
+    proba = model.predict_proba(features_v1(df, meta["cat_features"]))[:, 1]
+    return pd.Series(proba, index=df.index, name="churn_proba")
+
+
+def run():
+    """Score the labelled test split and all 1,500 predict customers with v1."""
+    model, meta = load_v1()
+    _, test_df = split_v1(pd.read_csv(TRAIN_CSV))
+    test = test_df[[TARGET, "rev"]].copy()
+    test["churn_proba"] = score_v1(test_df, model, meta)
+    test["decile"] = deciles(test["churn_proba"])
+
+    predict_df = pd.read_csv(PREDICT_CSV)
+    predict = predict_df[["Customer_ID"]].rename(columns={"Customer_ID": "customer_id"})
+    predict["churn_proba"] = score_v1(predict_df, model, meta)
     predict["decile"] = deciles(predict["churn_proba"])
     return test, predict
 
